@@ -16,30 +16,53 @@ from core.providers.tools.device_mcp.mcp_handler import call_mcp_tool
 
 TAG = __name__
 
+def _encourage_window_active(conn) -> bool:
+    now_ms = int(time.time() * 1000)
+    return bool(getattr(conn, "encourage_playing", False) and getattr(conn, "encourage_until_ms", 0) > now_ms)
+
 
 def with_state_system_note(conn, messages: list):
     mode = get_state(conn, "idle")  # idle | training | rest
     return [{"role":"system","content": f"[state] {mode}"}] + messages
 
 async def handleAudioMessage(conn, audio):
+
+     # === 状态闸门：在 training/rest 不进行聆听（不做VAD、不做ASR、不打断TTS）===
+    try:
+        mode = get_state(conn, "idle")
+    except Exception:
+        mode = "idle"
+    if mode in ("training", "rest"):
+        await no_voice_close_connect(conn, False)
+        return
     # 当前片段是否有人说话
     have_voice = conn.vad.is_vad(conn, audio)
+
     # 如果设备刚刚被唤醒，短暂忽略VAD检测
     if have_voice and hasattr(conn, "just_woken_up") and conn.just_woken_up:
         have_voice = False
-        # 设置一个短暂延迟后恢复VAD检测
         conn.asr_audio.clear()
         if not hasattr(conn, "vad_resume_task") or conn.vad_resume_task.done():
             conn.vad_resume_task = asyncio.create_task(resume_vad_detection(conn))
         return
 
+    # === 新增：鼓励保护窗内，忽略这段“有声”，避免打断 & 避免把TTS吸进ASR ===
+    if have_voice and _encourage_window_active(conn):
+        conn.logger.bind(tag=TAG).debug("[ENCOURAGE] window active: ignore voice chunk (no abort, no ASR)")
+        have_voice = False
+        # 可选：清空一次缓存，防止误触发
+        conn.asr_audio.clear()
+
+    # 仅在不处于保护窗时才允许打断
     if have_voice:
-        if conn.client_is_speaking:
+        if conn.client_is_speaking and not _encourage_window_active(conn):
             await handleAbortMessage(conn)
+
     # 设备长时间空闲检测，用于say goodbye
     await no_voice_close_connect(conn, have_voice)
-    # 接收音频
+    # 接收音频（在保护窗内 have_voice=False，不会被ASR作为“有效语音段”处理）
     await conn.asr.receive_audio(conn, audio, have_voice)
+
 
 
 async def resume_vad_detection(conn):
@@ -109,51 +132,22 @@ async def startToChat(conn, text):
         if check_device_output_limit(conn.headers.get("device-id"), conn.max_output_size):
             await max_out_size(conn)
             return
-    if conn.client_is_speaking:
+    if conn.client_is_speaking and not _encourage_window_active(conn):
         await handleAbortMessage(conn)
 
-    # === 1) 取设备状态 ===
+        # === 1) 取设备状态 ===
     mode = get_state(conn, "idle")  # idle | training | rest
 
-    # === 2) 状态前缀喂给意图识别（指令优先）===
+    # === 1.1) 训练/休息：硬静音（不做任何识别/意图/LLM），直接忽略 ===
+    if mode in ("training", "rest"):
+        conn.logger.bind(tag=TAG).info(f"[CHAT_GATE] hard mute: ignore ALL user text in {mode}")
+        return
+
+    # === 2) idle：允许意图与对话 ===
     state_prefixed_text = f"[state] {mode}\n{actual_text}"
     intent_handled = await handle_user_intent(conn, state_prefixed_text)
     conn.logger.bind(tag=TAG).info(f"[INTENT] handled={intent_handled} mode={mode} text={actual_text}")
     if intent_handled:
-        return  # 指令已执行
-
-    # === 3) 训练/休息：未命中意图时做“本地兜底”，不再调用 handle_user_intent ===
-    if mode == "training" and _looks_exit_training(actual_text):
-        ok = await _mcp_call(conn, "self_training_exit")   # 注意：传“清洗后”的名字
-        if ok:
-            # 设备已执行，服务器本地也同步状态，AI 立刻切换到 idle 逻辑
-            set_state(conn, "idle")
-            await send_stt_message(conn, "已退出训练")
-            await send_tts_message(conn, "stop", None)
-            conn.client_is_speaking = False
-        else:
-            # 调用失败时给一条简短提示（不切本地状态，避免跑偏）
-            await send_stt_message(conn, "退出训练失败，请稍后再试")
-        return
-
-    if mode == "rest" and _looks_skip_rest(actual_text):
-        ok = await _mcp_call(conn, "self_training_skip_rest")  # 注意：传“清洗后”的名字
-        if ok:
-            set_state(conn, "training")
-            await send_stt_message(conn, "已跳过休息，继续训练")
-            await send_tts_message(conn, "stop", None)
-            conn.client_is_speaking = False
-        else:
-            await send_stt_message(conn, "跳过休息失败，请稍后再试")
-        return
-
-    # === 4) 非指令内容的闸门：仅在 training/rest 拦截聊天 ===
-    conn.logger.bind(tag=TAG).info(f"[CHAT_GATE] mode={mode}")
-    if mode in ("training", "rest"):
-        await send_stt_message(conn, actual_text)   # 上报识别文本（便于可视化/日志）
-        await send_tts_message(conn, "stop", None)  # 立即停播语音，保持安静
-        conn.client_is_speaking = False
-        conn.logger.bind(tag=TAG).info(f"[CHAT_GATE] drop non-intent in {mode}")
         return
 
     # === 5) idle：放行给 LLM ===
@@ -166,6 +160,14 @@ async def no_voice_close_connect(conn, have_voice):
     if have_voice:
         conn.last_activity_time = time.time() * 1000
         return
+        # 训练/休息态下直接跳过超时结束话术
+    try:
+        mode = get_state(conn, "idle")
+    except Exception:
+        mode = "idle"
+    if mode in ("training", "rest"):
+        return
+
     # 只有在已经初始化过时间戳的情况下才进行超时检查
     if conn.last_activity_time > 0.0:
         no_voice_time = time.time() * 1000 - conn.last_activity_time

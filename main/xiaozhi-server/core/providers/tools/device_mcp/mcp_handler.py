@@ -8,6 +8,10 @@ from core.utils.util import get_vision_url, sanitize_tool_name
 from core.utils.auth import AuthToken
 from config.logger import setup_logging
 from core.state_registry import set_state,get_state
+from core.handle.sendAudioHandle import send_tts_message, SentenceType
+import time
+from core.providers.tts.dto.dto import TTSMessageDTO, ContentType, SentenceType as TTSSentenceType
+import uuid
 
 
 
@@ -97,6 +101,24 @@ class MCPClient:
         async with self.lock:
             if id in self.call_results:
                 self.call_results.pop(id)
+    
+async def handle_encourage(conn, params: dict):
+    # 仅限训练中
+    if get_state(conn, "idle") != "training":
+        conn.logger.bind(tag="MCP").info("[ENCOURAGE] ignore: not in training")
+        return
+
+    # 准备一点上下文（可选）
+    set_order = int(params.get("set", 0) or 0)
+    rep_index = int(params.get("rep", 0) or 0)
+    total     = int(params.get("total", 0) or 0)
+    ex_id     = int(params.get("exercise", -1) or -1)
+
+    # 用 LLM 生成一句非常短的鼓励
+    # 这里直接走 conn.chat，避免 startToChat 的聊天闸门
+    # 给一条“用户指令”式文本，明确长度与风格
+    instruct = f"【简短鼓励】已完成{rep_index}/{total}。只用一两句，口令风，避免寒暄。"
+    conn.executor.submit(conn.chat, instruct)
 
 
 async def send_mcp_message(conn, payload: dict):
@@ -212,11 +234,11 @@ async def handle_mcp_message(conn, mcp_client: MCPClient, payload: dict):
 
     # Handle method calls (requests from the client)
     elif "method" in payload:
-        method = payload["method"]
+        method = str(payload.get("method", "")).strip()
         logger.bind(tag=TAG).info(f"收到MCP客户端请求: {method}")
 
-      # === A) 统一设态 ===
-        if method == "notifications/state_set":
+      # === A) 统一设态（兼容多种别名）===
+        if method in ("notifications/state_set", "notification/set_state", "state_set", "set_state"):
             params = payload.get("params") or {}
             mode = (params.get("mode") or "").lower()
             if mode in ("idle", "training", "rest"):
@@ -228,21 +250,78 @@ async def handle_mcp_message(conn, mcp_client: MCPClient, payload: dict):
             else:
                 logger.bind(tag=TAG).warning(f"[MCP][STATE] ignore invalid mode: {mode}")
             return
+        
+        elif method == "notifications/encourage":
+            params = payload.get("params") or {}
+            logger.bind(tag=TAG).info(f"[MCP][ENCOURAGE] params={params}")
 
-        # === B) 兼容旧通知 ===
-        MAP = {
-            "notifications/training_started": "training",
-            "notifications/rest_entered":     "rest",
-            "notifications/rest_exited":      "training",
-            "notifications/training_exited":  "idle",
-        }
-        if method in MAP:
-            old = get_state(conn, "idle")
-            mode = MAP[method]
-            set_state(conn, mode)
-            logger.bind(tag=TAG).info(
-                f"[MCP][STATE] device={getattr(conn,'device_id',None)} {old} -> {mode} by {method}"
+            # 仅在 training 态播报
+            if get_state(conn, "idle") != "training":
+                logger.bind(tag=TAG).info("[MCP][ENCOURAGE] skip: not in training")
+                return
+
+            # 生成一句极短鼓励
+            sys_prompt = "你是小智。生成一句极短的训练鼓励（<= 12字），口令风，避免寒暄和标点滥用。"
+            set_ = params.get("set"); rep = params.get("rep"); total = params.get("total")
+            exercise = params.get("exercise"); phase = params.get("phase")
+            if rep and total:
+                user_prompt = f"第{set_ or '?'}组 {rep}/{total} 次，动作:{exercise or '?'}，阶段:{phase or 'late'}。来一句鼓励。"
+            else:
+                user_prompt = "训练中。来一句极短鼓励。"
+
+            try:
+                text = (conn.llm.response_no_stream(sys_prompt, user_prompt) or "").strip()
+            except Exception as e:
+                logger.bind(tag=TAG).warning(f"[MCP][ENCOURAGE] llm gen failed: {e}")
+                text = "稳住，别晃！"
+            if len(text) > 16:
+                text = text[:16]
+
+            # —— 保护窗：避免被 VAD/ASR 误触或打断 —— #
+            now_ms = int(time.time() * 1000)
+            conn.encourage_playing = True
+            # 估个时长：~ 250ms/字 + 500ms 余量
+            est_ms = int(len(text) * 250 + 500)
+            conn.encourage_until_ms = now_ms + max(1500, est_ms)
+            conn.last_activity_time = now_ms
+
+            # 若此刻在说话，先止住上一段
+            if getattr(conn, "client_is_speaking", False):
+                await send_tts_message(conn, "stop", None)
+                conn.client_is_speaking = False
+
+            # 关键：先发 start 让设备切到 Speaking
+            await send_tts_message(conn, "start", None)
+
+            # 准备一次独立的句子会话
+            conn.sentence_id = uuid.uuid4().hex
+            conn.tts.tts_audio_first_sentence = True
+
+            # FIRST → MIDDLE(TEXT) → LAST
+            conn.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=conn.sentence_id,
+                    sentence_type=SentenceType.FIRST,
+                    content_type=ContentType.ACTION,
+                )
             )
+            conn.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=conn.sentence_id,
+                    sentence_type=SentenceType.MIDDLE,
+                    content_type=ContentType.TEXT,
+                    content_detail=text,
+                )
+            )
+            conn.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=conn.sentence_id,
+                    sentence_type=SentenceType.LAST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+
+            logger.bind(tag=TAG).info(f"[MCP][ENCOURAGE] speak: {text}")
             return
 
 
