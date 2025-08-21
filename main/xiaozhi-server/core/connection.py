@@ -41,6 +41,8 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils import textUtils
 from core.state_registry import get_state
+from core.handle.sendAudioHandle import send_tts_message
+
 
 TAG = __name__
 
@@ -257,6 +259,152 @@ class ConnectionHandler:
                     self.logger.bind(tag=TAG).error(
                         f"强制关闭连接时出错: {close_error}"
                     )
+
+    def chat_tools_only(self, user_text: str, reason: str = "tools_only"):
+        """
+        用“聊天模型”的 functions 能力做一次 route：
+        - 有 tool_call：执行工具（工具内部需要播报的会自己播）
+        - 无 tool_call：直接丢弃（不TTS、不回显）
+        """
+        logger = self.logger.bind(tag="CHAT_GATE")
+        try:
+            # 1) 组装 llm_input（与 chat() 保持一致：记忆 + [state] 注记）
+            memory_str = None
+            if self.memory is not None:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.memory.query_memory(user_text), self.loop
+                )
+                memory_str = future.result()
+
+            llm_input = self.dialogue.get_llm_dialogue_with_memory(
+                memory_str, self.config.get("voiceprint", {})
+            )
+            llm_input = with_state_system_note(self, llm_input)
+
+            # 只把“用户发言”加入 llm_input，不写入 self.dialogue（直到确认有 tool_call）
+            try:
+                mode = get_state(self, "idle")
+                llm_input.append({"role": "user", "content": f"[state] {mode}\n{user_text}"})
+            except Exception:
+                llm_input.append({"role": "user", "content": user_text})
+
+            # 2) 准备 functions（与 chat() 一致）
+            functions = None
+            if self.intent_type == "function_call" and hasattr(self, "func_handler"):
+                functions = self.func_handler.get_functions()
+
+            if not functions:
+                logger.info("[DROP] tools-only: no functions registered or intent_type!=function_call")
+                return
+
+            # 3) 走带 functions 的对话（注意：不要用不存在的 create）
+            try:
+                llm_responses = self.llm.response_with_functions(
+                    self.session_id, llm_input, functions=functions
+                )
+            except Exception as e:
+                logger.warning(f"[TOOLS-ONLY] llm.response_with_functions error: {e}")
+                return
+
+            # 4) 解析流式响应，仿照 chat() 的逻辑，只关心 tool_call
+            tool_call_flag = False
+            function_name = None
+            function_id = None
+            function_arguments = ""
+            content_arguments = ""
+
+            for response in llm_responses:
+                if self.client_abort:
+                    break
+
+                # chat() 的两种返回形态都兼容：
+                # a) (content, tools_call) tuple
+                # b) dict/str，只含 content
+                content, tools_call = None, None
+                if isinstance(response, tuple) and len(response) == 2:
+                    content, tools_call = response
+                elif isinstance(response, dict) and "content" in response:
+                    content = response["content"]
+                elif isinstance(response, str):
+                    content = response
+
+                if content:
+                    content_arguments += content
+                    if not tool_call_flag and content_arguments.startswith("<tool_call>"):
+                        tool_call_flag = True
+
+                if tools_call:
+                    tool_call_flag = True
+                    tc0 = tools_call[0]
+                    if getattr(tc0, "id", None) is not None:
+                        function_id = tc0.id
+                    if getattr(tc0, "function", None) is not None:
+                        if getattr(tc0.function, "name", None) is not None:
+                            function_name = tc0.function.name
+                        if getattr(tc0.function, "arguments", None) is not None:
+                            function_arguments += tc0.function.arguments
+
+            if not tool_call_flag:
+                logger.info("[DROP] tools-only: no tool_call in chat output")
+                return
+
+            # 5) 如果没有从 tools_call 里拿到完整信息，尝试从 content 中抽 JSON
+            if function_id is None:
+                a = extract_json_from_string(content_arguments)
+                if a:
+                    try:
+                        content_arguments_json = json.loads(a)
+                        function_name = content_arguments_json["name"]
+                        function_arguments = json.dumps(
+                            content_arguments_json["arguments"], ensure_ascii=False
+                        )
+                        function_id = str(uuid.uuid4().hex)
+                    except Exception:
+                        logger.error(f"[TOOLS-ONLY] function_call parse error: {a}")
+                        return
+                else:
+                    logger.info("[DROP] tools-only: no function_call JSON extracted")
+                    return
+
+            if not function_name or function_name == "continue_chat":
+                logger.info(f"[DROP] tools-only: function_call={function_name}")
+                return
+
+            function_call_data = {
+                "name": function_name,
+                "id": function_id,
+                "arguments": function_arguments if isinstance(function_arguments, str) else json.dumps(function_arguments),
+            }
+
+            # 6) 现在才把“用户发言”写入对话历史，然后执行工具
+            self.dialogue.put(Message(role="user", content=user_text))
+
+            res = asyncio.run_coroutine_threadsafe(
+                self.func_handler.handle_llm_function_call(self, function_call_data),
+                self.loop
+            ).result()
+
+            self.logger.bind(tag="TOOLS-ONLY").info(
+                f"[TTSDEBUG] tool result action={getattr(res, 'action', None)} "
+                f"resp.len={len(getattr(res, 'response', '') or '')} "
+                f"result.len={len(getattr(res, 'result', '') or '')} "
+                f"sid={getattr(self, 'sentence_id', None)} q_text={self.tts.tts_text_queue.qsize()} q_audio={self.tts.tts_audio_queue.qsize()}"
+            )
+
+            if not getattr(self, "sentence_id", None):
+                self.sentence_id = str(uuid.uuid4().hex)
+                self.logger.bind(tag="TOOLS-ONLY").info(f"[TTSDEBUG] new sentence_id={self.sentence_id}")
+
+            # ✅ 用已有统一逻辑处理工具结果（内部会根据 Action 决定是否 TTS）
+            try:
+                self._handle_function_result(res, function_call_data, depth=0)
+            except Exception as e:
+                logger.error(f"[TOOLS-ONLY] handle_function_result error: {e}")
+            return
+
+        except Exception as e:
+            logger.warning(f"[TOOLS-ONLY] chat_tools_only error: {e}")
+            return
 
     async def _save_and_close(self, ws):
         """保存记忆并关闭连接"""
@@ -862,49 +1010,90 @@ class ConnectionHandler:
         return True
 
     def _handle_function_result(self, result, function_call_data, depth):
-        if result.action == Action.RESPONSE:  # 直接回复前端
-            text = result.response
-            self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=text)
-            self.dialogue.put(Message(role="assistant", content=text))
-        elif result.action == Action.REQLLM:  # 调用函数后再请求llm生成回复
+        if not getattr(self, "sentence_id", None):
+            self.sentence_id = str(uuid.uuid4().hex)
+
+        def _speak_via_pipeline(text: str, reason: str):
+            if not text:
+                self.logger.bind(tag="TTSDEBUG").warning(f"[PIPE] empty text, skip speak (reason={reason})")
+                return
+            now_ms = int(time.time() * 1000)
+            setattr(self, "encourage_playing", True)
+            setattr(self, "encourage_until_ms", now_ms + 4000)
+            self.client_is_speaking = True
+
+            self.logger.bind(tag="TTSDEBUG").info(
+                f"[PIPE] send_tts_message enter sid={self.sentence_id} reason={reason} "
+                f"text.len={len(text)} q_text={self.tts.tts_text_queue.qsize()} q_audio={self.tts.tts_audio_queue.qsize()}"
+            )
+            try:
+                fut = asyncio.run_coroutine_threadsafe(send_tts_message(self, text), self.loop)
+                fut.result()
+                self.logger.bind(tag="TTSDEBUG").info(
+                    f"[PIPE] send_tts_message done sid={self.sentence_id} q_text={self.tts.tts_text_queue.qsize()} q_audio={self.tts.tts_audio_queue.qsize()}"
+                )
+            except Exception as e:
+                self.logger.bind(tag="TTSDEBUG").error(f"[PIPE] send_tts_message failed: {e}")
+            finally:
+                self.dialogue.put(Message(role="assistant", content=text))
+                try:
+                    self.clearSpeakStatus()
+                except Exception:
+                    self.client_is_speaking = False
+
+        act = getattr(result, "action", None)
+        self.logger.bind(tag="TTSDEBUG").info(
+            f"[HANDLE] action={act} sid={self.sentence_id} "
+            f"resp.len={len(getattr(result,'response','') or '')} "
+            f"result.len={len(getattr(result,'result','') or '')}"
+        )
+
+        if act == Action.RESPONSE:
+            text = result.response if getattr(result, "response", None) else result.result
+            _speak_via_pipeline(text, "Action.RESPONSE")
+            return
+
+        elif act == Action.REQLLM:
             text = result.result
-            if text is not None and len(text) > 0:
+            self.logger.bind(tag="TTSDEBUG").info(f"[HANDLE] REQLLM -> chat depth=0 text.len={len(text or '')}")
+            if text:
                 function_id = function_call_data["id"]
                 function_name = function_call_data["name"]
                 function_arguments = function_call_data["arguments"]
-                self.dialogue.put(
-                    Message(
-                        role="assistant",
-                        tool_calls=[
-                            {
-                                "id": function_id,
-                                "function": {
-                                    "arguments": "{}" if function_arguments == "" else function_arguments,
-                                    "name": function_name,
-                                },
-                                "type": "function",
-                                "index": 0,
-                            }
-                        ],
-                    )
-                )
+                self.dialogue.put(Message(
+                    role="assistant",
+                    tool_calls=[{
+                        "id": function_id,
+                        "function": {"arguments": "{}" if function_arguments == "" else function_arguments,
+                                    "name": function_name},
+                        "type": "function",
+                        "index": 0,
+                    }],
+                ))
+                self.dialogue.put(Message(
+                    role="tool",
+                    tool_call_id=(str(uuid.uuid4()) if function_id is None else function_id),
+                    content=text,
+                ))
+                # 让 chat 自带 FIRST/MIDDLE/LAST
+                self.chat(text, tool_call=True, depth=0)
+            else:
+                self.logger.bind(tag="TTSDEBUG").warning("[HANDLE] REQLLM but empty text")
+            return
 
-                self.dialogue.put(
-                    Message(
-                        role="tool",
-                        tool_call_id=(
-                            str(uuid.uuid4()) if function_id is None else function_id
-                        ),
-                        content=text,
-                    )
-                )
-                self.chat(text, tool_call=True, depth=depth + 1)
-        elif result.action == Action.NOTFOUND or result.action == Action.ERROR:
-            text = result.response if result.response else result.result
-            self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=text)
-            self.dialogue.put(Message(role="assistant", content=text))
+        elif act in (Action.NOTFOUND, Action.ERROR):
+            text = result.response if getattr(result, "response", None) else result.result
+            _speak_via_pipeline(text, f"{act}")
+            return
+
         else:
-            pass
+            self.logger.bind(tag="TTSDEBUG").warning(f"[HANDLE] unknown action={act}, no speak")
+            return
+
+
+
+
+
 
     def _report_worker(self):
         """聊天记录上报工作线程"""

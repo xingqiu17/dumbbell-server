@@ -150,10 +150,22 @@ async def startToChat(conn, text):
     if intent_handled:
         return
 
-    # === 5) idle：放行给 LLM ===
-    await send_stt_message(conn, actual_text)
-    conn.logger.bind(tag=TAG).info("[CHAT_GATE] pass to LLM (idle)")
-    conn.executor.submit(conn.chat, actual_text)
+     # === 5) idle：命令模式拦截 / 非命令模式才放行 LLM ===
+    # 先尝试用意图识别走函数调用（命中才会说话）
+    try:
+        handled = await handle_user_intent(conn, actual_text)
+        if handled:
+            return
+    except Exception as e:
+        conn.logger.bind(tag=TAG).warning(f"[CHAT_GATE] intent handler error: {e}")
+
+    # === 兜底：走“聊天模型的 function_call”，纯文本一律丢弃 ===
+    try:
+        conn.logger.bind(tag=TAG).info("[CHAT_GATE] pass to LLM (tools-only)")
+        # 不要播“我听到你说…”之类回显
+        conn.executor.submit(conn.chat_tools_only, actual_text, "idle_tools_only")
+    except Exception as e:
+        conn.logger.bind(tag=TAG).warning(f"[CHAT_GATE] tools-only chat error: {e}")
 
 
 async def no_voice_close_connect(conn, have_voice):
