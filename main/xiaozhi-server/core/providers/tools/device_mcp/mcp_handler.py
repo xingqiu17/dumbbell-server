@@ -8,7 +8,7 @@ from core.utils.util import get_vision_url, sanitize_tool_name
 from core.utils.auth import AuthToken
 from config.logger import setup_logging
 from core.state_registry import set_state,get_state
-from core.handle.sendAudioHandle import send_tts_message, SentenceType
+from core.handle.sendAudioHandle import send_tts_message
 import time
 from core.providers.tts.dto.dto import TTSMessageDTO, ContentType, SentenceType as TTSSentenceType
 import uuid
@@ -323,6 +323,62 @@ async def handle_mcp_message(conn, mcp_client: MCPClient, payload: dict):
 
             logger.bind(tag=TAG).info(f"[MCP][ENCOURAGE] speak: {text}")
             return
+        
+        elif method == "notifications/weight_delta":
+            params = payload.get("params") or {}
+            delta = params.get("delta")
+            unit  = (params.get("unit") or "kg").lower()
+
+            # 解析 delta
+            try:
+                delta = float(delta)
+            except Exception:
+                logger.bind(tag=TAG).warning(f"[MCP][WEIGHT] invalid delta: {delta!r}")
+                return
+
+            # 组播文案（两位小数，kg → 千克）
+            direction = "增加" if delta > 0 else "减少"
+            unit_cn = "千克" if unit == "kg" else unit
+            say = f"{direction}{abs(delta):.2f}{unit_cn}"
+
+            # 若此刻在说话，先止住上一段（可选）
+            if getattr(conn, "client_is_speaking", False):
+                await send_tts_message(conn, "stop", None)
+                conn.client_is_speaking = False
+
+            # 起播：先发 start，再走 FIRST→MIDDLE(TEXT)→LAST
+            await send_tts_message(conn, "start", None)
+
+            conn.sentence_id = uuid.uuid4().hex
+            conn.tts.tts_audio_first_sentence = True   # 触发首句预缓冲
+            conn.last_activity_time = int(time.time() * 1000)
+
+            conn.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=conn.sentence_id,
+                    sentence_type=TTSSentenceType.FIRST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+            conn.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=conn.sentence_id,
+                    sentence_type=TTSSentenceType.MIDDLE,
+                    content_type=ContentType.TEXT,
+                    content_detail=say,
+                )
+            )
+            conn.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=conn.sentence_id,
+                    sentence_type=TTSSentenceType.LAST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+
+            logger.bind(tag=TAG).info(f"[MCP][WEIGHT] speak: {say}")
+            return
+
 
 
     elif "error" in payload:
